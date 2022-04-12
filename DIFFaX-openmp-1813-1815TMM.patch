@@ -1,0 +1,336 @@
+--- ./DIFFaX_1813/DIFFaX.f	2021-12-04 14:15:42.000000000 -0500
++++ DIFFaX.f	2022-02-24 07:48:22.000000000 -0500
+@@ -7,7 +7,7 @@
+ ********************      Source file DIFFaX.f       *******************
+ ************************************************************************
+ ************************************************************************
+-********************* version 1.812, 3rd July, 2005 ********************
++********************* version 1.815, 4th Dec, 2021 *********************
+ ************************************************************************
+ ************************************************************************
+ * This program calculates the powder diffraction spectrum of a crystal *
+@@ -119,6 +119,14 @@
+ * 5/10; MMJT: Changed the way WRTSADP writes big-endian 16-bit data.   *
+ *             Improved scratch-file clean-up.                (v1.813)  *
+ *                                                                      *
++* 4/20;  TMM: Change atom name reading to use NXTARG. Fixes bug where  *
++*             example input file in manual does not load.    (v1.814)  *
++*                                                                      *
++* 12/04; TMM: Added minimally functional OpenMP parallelization        *
++*             of h-loop integrations. Is not anywhere close to         *
++*             optimal, but provides trivial speedups for many          *
++*             cases, at the cost of memory.                 (v1.815)   *
++*                                                                      *
+ ************************************************************************
+ ****************************** Legal Note ******************************
+ ************************************************************************
+@@ -1156,10 +1164,10 @@
+ *                       accessed. (input).
+ *
+ *      COMMON VARIABLES:
+-*            uses:      spec, brd_spec, FFACT_SIZE, formfactor, d_theta
+-*                       ffact_scale, ffhkcnst, ffwdth
++*            uses:      thrdspec, thrd_brd_spc, FFACT_SIZE, formfactor, 
++*                       d_theta, ffact_scale, ffhkcnst, ffwdth
+ *
+-*        modifies:      spec, brd_spec
++*        modifies:      thrdspec, thrd_brd_spc
+ * ______________________________________________________________________
+ *
+       subroutine CHWDTH(h,k,l0,l1,x,m,max_indx)
+@@ -1174,7 +1182,7 @@
+ *
+       real*8 S, h_wdth, n_hw, d_hk, norm, l, scale, avg, xx, dx, tmp
+ *
+-* indx indexes into the arrays spec and brd_spec
++* indx indexes into the arrays spec and brd_spc
+ * n indexes into the array formfactor
+ * p is the index of the centroid of the array formfactor
+ * h_wdth contains the effective half-width of the size broadening
+@@ -1205,7 +1213,7 @@
+ * xx=1 means disk, xx=0 means streak. Intensity falls off more
+ * rapidly for a streak
+           dx = ((ONE-xx)*sqrt(dble(indx))*tmp + xx)*tmp
+-          if(m+indx-1.le.max_indx) brd_spc(m+indx-1) = dx
++          if(m+indx-1.le.max_indx) thrd_brd_spc(m+indx-1) = dx
+           norm = norm + dx
+ * eps5 is reasonable. However, it may be worth experimenting more.    
+           if(dx.lt.eps5) goto 20
+@@ -1214,7 +1222,8 @@
+ *
+       norm = x / norm
+       do 30 i = 0, indx - 1
+-        if(m+i.le.max_indx) spec(m+i) = spec(m+i) + norm*brd_spc(m+i)
++        if(m+i.le.max_indx) thrdspec(m+i) = thrdspec(m+i)
++     *                                      + norm*thrd_brd_spc(m+i)
+    30 continue
+ *
+ * We were on the 00l axis, we can exit now
+@@ -1236,7 +1245,7 @@
+ *
+       p = FFACT_SIZE/2 + 1
+       norm = ONE
+-      brd_spc(m) = ONE
++      thrd_brd_spc(m) = ONE
+       indx = 0
+    40 indx = indx + 1
+         n_hw = indx*scale
+@@ -1245,18 +1254,20 @@
+ * linear interpolation of the pre-computed pseudo-Lorentzian
+         xx = n_hw - n
+         avg = (ONE-xx)*formfactor(p+n) + xx*formfactor(p+n+1)
+-        if(m+indx.le.max_indx) brd_spc(m+indx) = avg
+-        if(m-indx.gt.0)        brd_spc(m-indx) = avg
++        if(m+indx.le.max_indx) thrd_brd_spc(m+indx) = avg
++        if(m-indx.gt.0)        thrd_brd_spc(m-indx) = avg
+ * intensity x is being redistributed. We will need to normalize later
+         norm = norm + TWO*avg
+         goto 40
+    50 continue
+ *
+       norm = x / norm
+-      spec(m) = spec(m) + norm*brd_spc(m)
++      thrdspec(m) = thrdspec(m) + norm*thrd_brd_spc(m)
+       do 60 i = 1, indx - 1
+-        if(m+i.le.max_indx) spec(m+i) = spec(m+i) + norm*brd_spc(m+i)
+-        if(m-i.gt.0)        spec(m-i) = spec(m-i) + norm*brd_spc(m-i)
++        if(m+i.le.max_indx) thrdspec(m+i) = thrdspec(m+i)
++     *                                      + norm*thrd_brd_spc(m+i)
++        if(m-i.gt.0)        thrdspec(m-i) = thrdspec(m-i)
++     *                                      + norm*thrd_brd_spc(m-i)
+    60 continue
+ *
+       return
+@@ -2925,7 +2936,8 @@
+       real*8 FN
+       character*(*) infile
+ *
+-      logical ok, SHARP, on_bndry, l_axis, shrp
++      logical ok, SHARP, on_bndry, l_axis, shrp, thrderr
++      integer*4 thrderrjmp
+       integer*4 h, k, h_lower, h_upper, k_lower, k_upper
+       integer*4 m, i, max_indx
+       integer*4 LENGTH
+@@ -2963,6 +2975,7 @@
+ *
+       GETSPC = .FALSE.
+       ok = .true.
++      thrderr = .false.
+ *
+ * Make sure we are within bounds. If not, adjust.
+       min_th = HALF * th2_min
+@@ -3007,9 +3020,17 @@
+       k_upper = int(tmp3 * sqrt(a0))
+       k_lower = -k_upper
+ * scan along h-axis from h_lower to h_upper
++!$omp parallel do
++!$omp* default(firstprivate)
++!$omp* shared(thrderr,thrderrjmp,spec,brd_spc)
+       do 20 h = h_lower, h_upper
++        do 11 i = 1, MAX_SP
++          thrdspec(i) = ZERO
++          thrd_brd_spc(i) = ZERO
++   11   continue
+ * determine limits along k for a given h
+         do 30 k = k_lower, k_upper
++          if (thrderr) goto 20
+ * if out of bounds, cycle
+           if(S(h,k,ZERO).gt.Q*Q) goto 30
+           l_axis = h.eq.0 .and. k.eq.0
+@@ -3052,7 +3073,11 @@
+               endif
+               if(any_sharp .and. full_shrp.ne.1) then
+                 shrp = SHARP(h, k, d_l)
+-                if(.not.ok) goto 999
++                if(.not.ok) then
++                  thrderrjmp=999
++                  thrderr=.true.
++                  goto 20
++                endif
+               else
+                 shrp = any_sharp
+               endif
+@@ -3075,7 +3100,11 @@
+ * broad streaks
+                   x = FN(h, k, l0, l1, ok)
+                 endif
+-                if(.not.ok) goto 110
++                if(.not.ok) then
++       	       	  thrderrjmp=110 
++       	       	  thrderr=.true.
++       	       	  goto 20
++                endif    
+ *
+ * include weighting factors for radiation type
+                 if(rad_type.eq.X_RAY) then
+@@ -3086,7 +3115,9 @@
+                   x = TWO * x * W3(theta + HALF * tmp2)
+                 else
+                   ok = .false.
+-                  goto 130
++       	       	  thrderrjmp=130 
++       	       	  thrderr=.true.
++       	       	  goto 20
+                 endif
+ *
+ * see if not on l-axis
+@@ -3099,7 +3130,7 @@
+                 if(finite_width) then
+                   call CHWDTH(h,k,l0,l1,x,m,max_indx)
+                 else
+-                  spec(m) = spec(m) + x
++                  thrdspec(m) = thrdspec(m) + x
+                 endif
+                 m = m + 1
+    40         continue
+@@ -3126,16 +3157,28 @@
+                 tmp = INTENS(f, h, k, l, ok) * eps8
+ * find width of peak
+                 x = eps10
+-   80             if(.not.ok) goto 120
++   80             if(.not.ok) then
++       	       	    thrderrjmp=120 
++       	       	    thrderr=.true.
++       	            goto 20
++                  endif    
+                   x = TWO * x
+                   call GET_F(f, S(h,k,l+x), l+x)
+                   if(INTENS(f, h, k, l+x, ok).gt.tmp .and.
+      |                  x.le.eps2*d_l) goto 80
+-                if(.not.ok) goto 120
++                if(.not.ok) then
++       	       	  thrderrjmp=120 
++       	       	  thrderr=.true.
++       	       	  goto 20
++                endif    
+                 l0 = max(l - x, ZERO)
+                 l1 = min(l + x, l_max)
+                 x = AGLQ16(h, k, l0, l1, ok)
+-                if(.not.ok) goto 110
++                if(.not.ok) then
++       	       	  thrderrjmp=110
++       	       	  thrderr=.true.
++       	       	  goto 20
++                endif    
+ *
+ * include weighting factors for radiation type
+                 if(rad_type.eq.X_RAY) then
+@@ -3146,7 +3189,9 @@
+                   x = TWO * x * W3(theta)
+                 else
+                   ok = .false.
+-                  goto 130
++       	       	  thrderrjmp=130 
++       	       	  thrderr=.true.
++       	       	  goto 20
+                 endif
+ *
+ * see if not on l-axis
+@@ -3160,13 +3205,27 @@
+                 if(finite_width) then
+                   call CHWDTH(h,k,l0,l1,x,m,max_indx)
+                 else
+-                  spec(m) = spec(m) + x
++                  thrdspec(m) = thrdspec(m) + x
+                 endif
+    70         continue
+             endif
+           endif
+    30   continue
++!$omp critical
++* add thread generated values to global in thread-safe way
++      do 12 i = 1, MAX_SP
++        spec(i) = spec(i) + thrdspec(i)
++        brd_spc(i) = brd_spc(i) + thrd_brd_spc(i)
++   12 continue
++!$omp end critical
+    20 continue
++      if (thrderr) then
++        if (thrderrjmp.eq.110) goto 110
++        if (thrderrjmp.eq.120) goto 120
++        if (thrderrjmp.eq.130) goto 130
++        write(op,300) 'Unknown error in thread in GETSPC.'
++        goto 999
++      endif
+       GETSPC = .true.
+       return
+   110 write(op,300) 'GLQ16 returned error in GETSPC.'
+@@ -7637,12 +7696,14 @@
+               messge = ' $'
+               goto 999
+             endif
+-*
+-            a_name(j,m) = line(1:4)
++* read atom name
++            write(tmpline, '(a)', err=999) line
++            n = NXTARG(tmpline,arg)
++            if(n.le.0) goto 999
++            read(arg,'(a4)') a_name(j,m)
+ *
+             write(messge,103)
+      |        'Problems reading data for atom ''', a_name(j,m), '''.$'
+-            write(tmpline, '(a)', err=999) line(5:len(line))
+ * read atom identifier
+             n = NXTARG(tmpline,arg)
+             if(n.le.0) goto 999
+@@ -8830,7 +8891,7 @@
+ * ______________________________________________________________________
+ * Title: SALUTE
+ * Author: MMJT
+-* Date: 19th May, 2010
++* Date: 4th Dec, 2021
+ * Draws the DIFFaX flag. Saluting is optional.
+ *
+ *      ARGUMENTS:
+@@ -8851,9 +8912,9 @@
+       write(op,1) '*  DDDD     II   F        F        aaa a   X   X  *'
+       write(op,1) '*                                                 *'
+       write(op,1) '***************************************************'
+-      write(op,1) '****************** DIFFaX v1.813 ******************'
++      write(op,1) '****************** DIFFaX v1.815 ******************'
+       write(op,1) '***************************************************'
+-      write(op,1) '***************** 19th May,  2010 *****************'
++      write(op,1) '***************** 4th  Dec,  2021 *****************'
+       write(op,1) '***************************************************'
+       write(op,1) '*                                                 *'
+       write(op,1) '*   A computer program for calculating            *'
+--- DIFFaX.inc.orig	2005-01-20 21:07:54.000000000 -0500
++++ DIFFaX.inc	2022-04-12 08:22:06.327992750 -0400
+@@ -398,7 +398,8 @@
+      |       r_B11(MAX_L,MAX_L),r_B22(MAX_L,MAX_L),r_B33(MAX_L,MAX_L),
+      |       r_B12(MAX_L,MAX_L),r_B23(MAX_L,MAX_L),r_B31(MAX_L,MAX_L),
+      |       hx_ky(MAX_A,MAX_L), spec(MAX_SP), brd_spc(MAX_SP),
+-     |       detune(MAX_L,MAX_L), x_sf(9,MAX_TA)
++     |       detune(MAX_L,MAX_L), x_sf(9,MAX_TA), thrdspec(MAX_SP),
++     |       thrd_brd_spc(MAX_SP)
+       real*8 a_B11,a_B22,a_B33,a_B12,a_B23,a_B31
+       real*8 tolerance, max_var, max_angle, l_bnd, l_rz,
+      |       PI, PI2, RAD2DEG, DEG2RAD, scaleint, brightness, lambda,
+@@ -436,7 +437,7 @@
+ *
+       common /reals1/ l_alpha, l_r, l_g, a_pos, a_B,a_occup, high_atom,
+      |                low_atom, r_B11,r_B22,r_B33, r_B12,r_B23,r_B31,
+-     |                hx_ky,spec, brd_spc, detune, x_sf
++     |                spec, detune, x_sf, brd_spc
+       common /reals2/ a_B11,a_B22,a_B33,a_B12,a_B23,a_B31
+       common /reals3/ tolerance, max_var, max_angle, l_bnd, l_rz,
+      |                PI, PI2, RAD2DEG, DEG2RAD, scaleint,
+@@ -444,10 +445,15 @@
+      |                h_start, k_start,h_end, k_end, cell_a, cell_b,
+      |                cell_c, cell_gamma, pv_u, pv_v, pv_w, pv_gamma,
+      |                FWHM, mltplcty, bnds_wt, theta1, theta2, a0, b0,
+-     |                c0, d0, ab0, bc0, ca0, tiny_inty, fatsWalla_hk
+-      common /reals4/ formfactor, ffact_scale, Wa, Wb, ffhkcnst, ffwdth
++     |                c0, d0, ab0, bc0, ca0, tiny_inty
++      common /reals4/ formfactor, ffact_scale, Wa, Wb, ffwdth
+ *
+-      common /cmplx1/ mat, mat1, l_phi, wavefn
++      common /cmplx1/ wavefn
++*
++      common /thrd1/ thrdspec, thrd_brd_spc, mat, mat1, l_phi,
++     |               fatsWalla_hk, hx_ky, ffhkcnst
+ *
+       equivalence (n_sf, x_sf)
+ *
++!$omp threadprivate(/thrd1/)
++

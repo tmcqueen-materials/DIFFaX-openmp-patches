@@ -1,0 +1,11 @@
+--- ./DIFFaX_1813/DIFFaX.par	2021-12-04 14:15:42.000000000 -0500
++++ DIFFaX.par	2021-12-04 10:10:08.000000000 -0500
+@@ -57,7 +57,7 @@
+ *
+       implicit none
+       integer*4 MAX_L, MAX_A, MAX_TA, MAX_SP, SADSIZE
+-      parameter (MAX_L=20,MAX_A=200,MAX_TA=20,MAX_SP=20001,SADSIZE=256)
++      parameter (MAX_L=20,MAX_A=800,MAX_TA=20,MAX_SP=20001,SADSIZE=256)
+       integer*4 XP_MAX, RCSV_MAX, MAX_NAM, MAX_BIN
+       parameter (XP_MAX=5000, RCSV_MAX=1022, MAX_NAM=31, MAX_BIN=10)
+       integer*4 FFACT_SIZE, N_SIGMAS
